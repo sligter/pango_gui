@@ -11,6 +11,8 @@ import (
 	"pango-gui/server"
 	"runtime"
 
+	"image/color"
+
 	"gioui.org/app"
 	_ "gioui.org/app/permission/storage"
 	"gioui.org/layout"
@@ -43,12 +45,13 @@ type State struct {
 	LogEditor       widget.Editor
 	Config          ServerConfig
 	FolderPickerBtn widget.Clickable
+	AuthorLink      widget.Clickable
 }
 
 func main() {
 	go func() {
 		w := app.Window{}
-		w.Option(app.Title("pango - v0.0.1"))
+		w.Option(app.Title("pango - v0.0.2"))
 		state := State{
 			UploadDir: widget.Editor{SingleLine: true, Submit: true},
 			Username:  widget.Editor{SingleLine: true, Submit: true},
@@ -215,8 +218,16 @@ func loop(w *app.Window, state *State) error {
 							return noBorderMaterialEditor(th, &state.LogEditor, "Log Output").Layout(gtx)
 						})
 					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(24)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							authorLabel := material.Body1(th, "\n\n\n\n\nBy: sligter\nhttps://github.com/sligter")
+							authorLabel.Color = color.NRGBA{R: 0, G: 0, B: 255, A: 255} // 蓝色
+							return authorLabel.Layout(gtx)
+						})
+					}),
 				)
 			})
+
 			e.Frame(gtx.Ops)
 		}
 	}
