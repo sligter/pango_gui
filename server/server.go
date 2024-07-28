@@ -127,6 +127,10 @@ func StartServer(uploadDirPath, username, password, port, domain string) error {
 		Handler:      mux,                  // Use the ServeMux we created
 		ReadTimeout:  365 * 24 * time.Hour, // 设置为一年
 		WriteTimeout: 365 * 24 * time.Hour,
+		Addr:         listenAddress,        // or domain:port based on earlier logic
+		Handler:      mux,                  // Use the ServeMux we created
+		ReadTimeout:  365 * 24 * time.Hour, // 设置为一年
+		WriteTimeout: 365 * 24 * time.Hour,
 	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -370,6 +374,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 处理文件上传
+	if err := r.ParseMultipartForm(32 << 20); err != nil { // 限制最大上传文件大小为10MB
 	if err := r.ParseMultipartForm(32 << 20); err != nil { // 限制最大上传文件大小为10MB
 		http.Error(w, "File too large.", http.StatusBadRequest)
 		return
@@ -617,6 +622,7 @@ func isJPEGFile(fileName string) bool {
 
 func isTextFile(fileName string) bool {
 	// 这里我们仅检查几种常见的文本文件扩展名
+	textExtensions := []string{".txt", ".md", ".csv", ".json", ".xml", ".html", ".js", ".css", ".py", ".java", ".c", ".cpp", ".sh", ".json", ".go", ".r", ".rs"}
 	textExtensions := []string{".txt", ".md", ".csv", ".json", ".xml", ".html", ".js", ".css", ".py", ".java", ".c", ".cpp", ".sh", ".json", ".go", ".r", ".rs"}
 	for _, ext := range textExtensions {
 		if strings.HasSuffix(strings.ToLower(fileName), ext) {
