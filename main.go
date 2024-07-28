@@ -51,7 +51,7 @@ type State struct {
 func main() {
 	go func() {
 		w := app.Window{}
-		w.Option(app.Title("pango - v0.0.2"))
+		w.Option(app.Title("pango - v0.0.3"))
 		state := State{
 			UploadDir: widget.Editor{SingleLine: true, Submit: true},
 			Username:  widget.Editor{SingleLine: true, Submit: true},
@@ -253,6 +253,7 @@ func StartServer(state *State) {
 	server.StartServer(state.Config.UploadDir, state.Config.Username, state.Config.Password, state.Config.Port, state.Config.Domain)
 
 	// Output server start log messages
+	fmt.Println("Developed by sligter-老舟")
 	fmt.Println("Starting server with the following settings:")
 	fmt.Printf("Pango Directory: %s\n", state.Config.UploadDir)
 	fmt.Printf("Username: %s\n", state.Config.Username)

@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
@@ -19,24 +21,27 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
+
+//go:embed static/*
+var staticFiles embed.FS
 
 var (
 	uploadDir      string
 	sharedFiles    = make(map[string]string)
-	users          map[string]string         // 用户名:密码映射，生产环境中应使用加密密码
-	sessions       = make(map[string]string) // 会话ID和用户名的映射
-	downloadCounts = make(map[string]int)    //统计下载次数
+	users          map[string]string                           // 用户名:密码映射，生产环境中应使用加密密码
+	sessions                         = make(map[string]string) // 会话ID和用户名的映射
+	downloadCounts                   = make(map[string]int)    //统计下载次数
+	maxUploadSize  int64             = 100 << 30
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
+// var upgrader = websocket.Upgrader{
+// 	CheckOrigin: func(r *http.Request) bool {
+// 		return true
+// 	},
+// }
 
 func getLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
@@ -74,6 +79,7 @@ func StartServer(uploadDirPath, username, password, port, domain string) error {
 		log.Fatalf("Error creating upload directory: %v", err)
 	}
 	mux := http.NewServeMux()
+	mux.Handle("/static/", http.StripPrefix("", http.FileServer(http.FS(staticFiles))))
 	mux.HandleFunc("/", ensureLoggedIn(indexHandler))
 	mux.HandleFunc("/upload", ensureLoggedIn(uploadHandler))
 	mux.HandleFunc("/files", ensureLoggedIn(filesHandler))
@@ -90,7 +96,6 @@ func StartServer(uploadDirPath, username, password, port, domain string) error {
 	mux.HandleFunc("/move", ensureLoggedIn(moveHandler))
 	mux.HandleFunc("/new-text-file", ensureLoggedIn(newTextFileHandler))
 	mux.Handle("/statics/", static_ensureLoggedIn(http.StripPrefix("/statics/", http.FileServer(http.Dir(uploadDir)))))
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
 	mux.HandleFunc("/save", func(w http.ResponseWriter, r *http.Request) {
 		// 从POST请求中获取文件路径和内容
 		filePath := r.FormValue("file")
@@ -188,16 +193,13 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	//http.Redirect(w, r, "/files?path="+url.QueryEscape(uploadDir), http.StatusFound)
 }
 
-//go:embed static/images/backup-background.jpg
-var backupBackgroundImage embed.FS
-
 func loginFormHandler(w http.ResponseWriter, r *http.Request) {
 	if isLoggedIn(r) {
 		http.Redirect(w, r, "/", http.StatusFound)
 		return
 	}
 	// 获取本地图片文件的URL
-	imageURL := "/static/images/backup-background.jpg"
+	imageURL := "/static/images/backup-background.jpgs"
 	tmpl := template.Must(template.New("login-form").Parse(`
 	<!DOCTYPE html>
 	<html lang="en">
@@ -205,7 +207,8 @@ func loginFormHandler(w http.ResponseWriter, r *http.Request) {
 		<meta charset="UTF-8">
 		<meta name="viewport" content="width=device-width, initial-scale=1.0">
 		<title>Login - Pango</title>
-		<link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+		<link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
+		<link href="/static/css/bootstrap.min.css" rel="stylesheet">
 		<style>
 			body {
 				height: 100vh;
@@ -242,9 +245,9 @@ func loginFormHandler(w http.ResponseWriter, r *http.Request) {
 				</div>
 			</div>
 		</div>
-		<script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
-		<script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.3/dist/umd/popper.min.js"></script>
-		<script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+		<script src="/static/jquery/jquery-3.5.1.slim.min.js"></script>
+		<script src="/static/js/popper.min.js"></script>
+		<script src="/static/js/bootstrap.min.js"></script>
 	</body>
 	</html>
     `))
@@ -369,75 +372,86 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 处理文件上传
-	if err := r.ParseMultipartForm(32 << 20); err != nil { // 限制最大上传文件大小为10MB
-		http.Error(w, "File too large.", http.StatusBadRequest)
+	// 设置最大请求体大小
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+
+	reader, err := r.MultipartReader()
+	if err != nil {
+		http.Error(w, "Error parsing multipart form: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// 处理多文件上传
-	files := r.MultipartForm.File["files"]
-	for _, fileHeader := range files {
-		file, err := fileHeader.Open()
+	// 使用 sync.Pool 来重用缓冲区
+	bufferPool := sync.Pool{
+		New: func() interface{} {
+			return make([]byte, 32*1024) // 32KB 缓冲区
+		},
+	}
+
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
 		if err != nil {
-			http.Error(w, "Unable to open the file: "+err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Error reading multipart form: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		defer file.Close()
+		defer part.Close()
 
-		filePath := filepath.Join(fullPath, filepath.Base(fileHeader.Filename))
-		dst, err := os.Create(filePath)
+		fileName := part.FileName()
+		if fileName == "" {
+			continue
+		}
+
+		var filePath string
+		if part.FormName() == "files" {
+			filePath = filepath.Join(fullPath, filepath.Base(fileName))
+		} else if part.FormName() == "folder" {
+			relativePath := filepath.ToSlash(fileName)
+			filePath = filepath.Join(fullPath, relativePath)
+			if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+				http.Error(w, "Unable to create directory for file: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			continue
+		}
+
+		dst, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 		if err != nil {
 			http.Error(w, "Unable to create the file: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		defer dst.Close()
 
-		if _, err := io.Copy(dst, file); err != nil {
-			http.Error(w, "Unable to save the file: "+err.Error(), http.StatusInternalServerError)
+		// 使用缓冲的写入器
+		bufWriter := bufio.NewWriterSize(dst, 1024*1024) // 1MB 缓冲区
+
+		// 从池中获取缓冲区
+		buffer := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buffer)
+
+		written, err := io.CopyBuffer(bufWriter, io.LimitReader(part, maxUploadSize+1), buffer)
+		if err != nil {
+			http.Error(w, "Error writing file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// 刷新缓冲的写入器
+		if err := bufWriter.Flush(); err != nil {
+			http.Error(w, "Error flushing file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if written > maxUploadSize {
+			os.Remove(filePath)
+			http.Error(w, "File too large: "+fileName, http.StatusBadRequest)
 			return
 		}
 	}
 
-	// 处理文件夹上传
-	folders := r.MultipartForm.File["folder"]
-	for _, folderHeader := range folders {
-		// Open the file header to get the file part.
-		file, err := folderHeader.Open()
-		if err != nil {
-			http.Error(w, "Unable to open the file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer file.Close()
-
-		// The folderHeader.Filename will contain the relative path of the file
-		// including any subdirectories within the uploaded folder. We need to
-		// create these subdirectories within the server's file system.
-		relativePath := filepath.ToSlash(folderHeader.Filename) // Ensure we have forward slashes
-		filePath := filepath.Join(fullPath, relativePath)
-
-		// Create any necessary directories for the file path
-		if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
-			http.Error(w, "Unable to create directory for file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		// Create the destination file on the server
-		dst, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Unable to create the file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer dst.Close()
-
-		// Copy the uploaded file to the destination file
-		if _, err := io.Copy(dst, file); err != nil {
-			http.Error(w, "Unable to save the file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
 	http.Redirect(w, r, "/files?path="+url.QueryEscape(currentPath), http.StatusFound)
-	//fmt.Fprintf(w, "File uploaded successfully: %s", fullPath)
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
@@ -564,6 +578,7 @@ func serveFile(w http.ResponseWriter, fileName string) {
 	io.Copy(w, file)
 }
 
+// 替换原有的 shareHandler 函数
 func shareHandler(w http.ResponseWriter, r *http.Request) {
 	fileName := r.URL.Query().Get("file")
 	if fileName == "" {
@@ -583,18 +598,18 @@ func shareHandler(w http.ResponseWriter, r *http.Request) {
 
 	var shareURL string
 	if info.IsDir() {
-		// 如果是文件夹，生成指向共享文件夹处理函数的链接
 		shareURL = fmt.Sprintf("http://%s/shared-folder/%s", r.Host, shareID)
 	} else {
-		// 如果是文件，生成指向共享文件下载处理函数的链接
 		shareURL = fmt.Sprintf("http://%s/shared/%s", r.Host, shareID)
 	}
 
-	fmt.Fprintf(w, "Shared successfully. Access at \n%s ", shareURL)
+	// 返回 JSON 响应
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"url": shareURL})
 }
 
 func isMediaFile(fileName string) bool {
-	// 这里我们仅检查几种常见的媒体文件扩展名
+	// 仅检查几种常见的媒体文件扩展名
 	mediaExtensions := []string{".mp4", ".mp3", ".avi", ".wav", ".mov", ".ts", ".m4a", ".amr", ".flac", ".aac", ".mkv"}
 	for _, ext := range mediaExtensions {
 		if strings.HasSuffix(strings.ToLower(fileName), ext) {
@@ -605,7 +620,7 @@ func isMediaFile(fileName string) bool {
 }
 
 func isJPEGFile(fileName string) bool {
-	// 这里我们仅检查几种常见的图片文件扩展名
+	// 仅检查几种常见的图片文件扩展名
 	jpgExtensions := []string{".jpg", ".png", ".jpeg", ".tif", ".gif", ".ico", ".bmp"}
 	for _, ext := range jpgExtensions {
 		if strings.HasSuffix(strings.ToLower(fileName), ext) {
@@ -616,7 +631,7 @@ func isJPEGFile(fileName string) bool {
 }
 
 func isTextFile(fileName string) bool {
-	// 这里我们仅检查几种常见的文本文件扩展名
+	// 仅检查几种常见的文本文件扩展名
 	textExtensions := []string{".txt", ".md", ".csv", ".json", ".xml", ".html", ".js", ".css", ".py", ".java", ".c", ".cpp", ".sh", ".json", ".go", ".r", ".rs"}
 	for _, ext := range textExtensions {
 		if strings.HasSuffix(strings.ToLower(fileName), ext) {
@@ -664,11 +679,74 @@ func sharedFilesHandler(w http.ResponseWriter, r *http.Request, sharedPath strin
 		return files[i].Name() < files[j].Name()
 	})
 
-	fmt.Fprintf(w, "<h1>Shared Files in %s</h1>", sharedPath)
+	fmt.Fprintf(w, `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Pango Shared Files</title>
+		<link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
+        <link rel="stylesheet" href="/static/css/bootstrap.min.css">
+        <link rel="stylesheet" href="/static/css/codemirror.min.css">
+        <style>
+            .file-item {
+                padding: 15px;
+                border-bottom: 1px solid #eee;
+                transition: background-color 0.3s;
+            }
+            .file-item:hover {
+                background-color: #f8f9fa;
+            }
+            .btn {
+                border-radius: 20px;
+                padding: 5px 15px;
+                margin: 2px;
+                transition: all 0.3s;
+            }
+            .btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            }
+            .preview-container {
+                margin-top: 15px;
+                margin-bottom: 15px;
+            }
+            .CodeMirror {
+                height: 300px;
+                border: 1px solid #ddd;
+                border-radius: 5px;
+            }
+            @media (max-width: 768px) {
+                .btn-group-sm > .btn {
+                    padding: 3px 8px;
+                    font-size: 0.75rem;
+                }
+                .file-item .row {
+                    flex-direction: column;
+                }
+                .file-item .col-md-6 {
+                    width: 100%%;
+                    margin-bottom: 10px;
+                }
+                .btn-group {
+                    display: flex;
+                    flex-wrap: wrap;
+                    justify-content: center;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container mt-4">
+            <h1 class="mb-4">Shared Files in %s</h1>
+            <div class="file-list">
+    `, sharedPath)
+
 	for i, file := range files {
 		fileName := file.Name()
 		filePath := filepath.Join(sharedPath, fileName)
-		relativeFilePath := filePath // 这是相对于uploads的路径
+		relativeFilePath := filePath
 
 		info, err := file.Info()
 		if err != nil {
@@ -679,126 +757,165 @@ func sharedFilesHandler(w http.ResponseWriter, r *http.Request, sharedPath strin
 		var fileSize string
 		if file.IsDir() {
 			fileSize = "N/A"
-			// 文件夹，提供链接到该文件夹
-			// 找到共享ID
 			shareID := findShareID(filePath)
-			fmt.Fprintf(w, "<p>[Folder] %s (Last modified: %s) - <a href='/shared-folder/%s'>Open</a></p>", fileName, modTime, shareID)
-			// fmt.Fprintf(w, "<p>[Folder] %s (Last modified: %s) - <a href='/shared-folder/%s'>Open</a></p>", fileName, modTime, url.QueryEscape(relativeFilePath))
+			fmt.Fprintf(w, `
+                <div class="file-item">
+                    <div class="row align-items-center">
+                        <div class="col-md-6 mb-2 mb-md-0">
+                            <strong>[Folder] %s</strong><br>
+                            <small class="text-muted">Last modified: %s</small>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="btn-group btn-group-sm d-flex flex-wrap justify-content-end" role="group">
+                                <a href='/shared-folder/%s' class="btn btn-primary">Open</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `, fileName, modTime, shareID)
 		} else {
 			fileSize = fmt.Sprintf("%.2f KB", float64(info.Size())/1024)
-			if isMediaFile(fileName) {
-				mediaPlayerButton := generateMediaPlayer(relativeFilePath, "player"+strconv.Itoa(i))
-				fmt.Fprintf(w, "<p>%s (size: %s) - (Last modified: %s) - <a href='/download-share?file=%s'>Download</a>%s</p>", fileName, fileSize, modTime, url.QueryEscape(relativeFilePath), mediaPlayerButton)
-			} else if isJPEGFile(fileName) {
-				imagePreviewButton := generateImagePreview(relativeFilePath, "preview"+strconv.Itoa(i))
-				fmt.Fprintf(w, "<p>%s (size: %s) - (Last modified: %s) - <a href='/download-share?file=%s'>Download</a>%s</p>", fileName, fileSize, modTime, url.QueryEscape(relativeFilePath), imagePreviewButton)
-			} else if isTextFile(fileName) {
-				textPreviewButton := generateTextPreview(relativeFilePath, "text"+strconv.Itoa(i))
-				fmt.Fprintf(w, "<p>%s (size: %s) - (Last modified: %s) - <a href='/download-share?file=%s'>Download</a>%s</p>", fileName, fileSize, modTime, url.QueryEscape(relativeFilePath), textPreviewButton)
-			} else {
-				fmt.Fprintf(w, "<p>%s (size: %s) - (Last modified: %s) - <a href='/download-share?file=%s'>Download</a>", fileName, fileSize, modTime, url.QueryEscape(relativeFilePath))
+			fmt.Fprintf(w, `
+                <div class="file-item">
+                    <div class="row align-items-center">
+                        <div class="col-md-6 mb-2 mb-md-0">
+                            <strong>%s</strong><br>
+                            <small class="text-muted">Size: %s, Last modified: %s</small>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="btn-group btn-group-sm d-flex flex-wrap justify-content-end" role="group">
+                                <a href='/download-share?file=%s' class="btn btn-primary">Download</a>
+            `, fileName, fileSize, modTime, url.QueryEscape(relativeFilePath))
+
+			if isMediaFile(fileName) || isJPEGFile(fileName) || isTextFile(fileName) {
+				fmt.Fprintf(w, `
+                                <button onclick="%s('%s', '%s')" class="btn btn-outline-secondary">Preview</button>
+                `, getPreviewFunction(fileName), url.QueryEscape(relativeFilePath), "preview"+strconv.Itoa(i))
 			}
-			// 文件，提供下载链接
-			// fmt.Fprintf(w, "<p>%s (Last modified: %s) - <a href='/shared/%s'>Download</a></p>", fileName, modTime, url.QueryEscape(relativeFilePath))
+
+			fmt.Fprintf(w, `
+                            </div>
+                        </div>
+                    </div>
+                    <div class="preview-container" id="%s"></div>
+                </div>
+            `, "preview"+strconv.Itoa(i))
 		}
 	}
+
 	fmt.Fprintf(w, `
-<script>
-function createAudioPlayer(filePath, id) {
-	var playerElement = document.getElementById(id);
-	if (playerElement.innerHTML !== '') {
-		// 如果已经创建了播放器，那么停止播放并隐藏
-		playerElement.innerHTML = '';
-	} else {
-		// 否则，创建新的播放器，但不自动加载媒体
-		playerElement.innerHTML = '<audio controls preload="auto" style="max-width: 80vw; max-height: 500px;"><source src="/download-share?file=' + filePath + '" type="audio/mpeg">Your browser does not support the audio element.</audio>';
+            </div>
+        </div>
+        <script src="/static/jquery/jquery-3.5.1.slim.min.js"></script>
+        <script src="/static/js/popper.min.js"></script>
+        <script src="/static/js/bootstrap.min.js"></script>
+        <script src="/static/js/codemirror.min.js"></script>
+        <script src="/static/js/javascript.min.js"></script>
+        <script src="/static/js/xml.min.js"></script>
+        <script src="/static/js/htmlmixed.min.js"></script>
+        <script src="/static/js/css.min.js"></script>
+        <script src="/static/js/markdown.min.js"></script>
+
+		<link rel="stylesheet" href="/static/css/codemirror.min.css">
+		<link rel="stylesheet" href="/static/css/monokai.min.css">
+		<link rel="stylesheet" href="/static/css/dracula.min.css">
+		<script src="/static/js/python.min.js"></script>
+		<script src="/static/js/go.min.js"></script>
+        <script>
+        function createMediaPlayer(filePath, id) {
+            var playerElement = document.getElementById(id);
+            if (playerElement.innerHTML !== '') {
+                playerElement.innerHTML = '';
+            } else {
+                var fileExtension = filePath.split('.').pop().toLowerCase();
+                if (fileExtension === 'mp3' || fileExtension === 'wav') {
+                    playerElement.innerHTML = '<audio controls preload="auto" style="width: 60%%;"><source src="/download-share?file=' + filePath + '" type="audio/' + fileExtension + '">Your browser does not support the audio element.</audio>';
+                } else {
+                    playerElement.innerHTML = '<video controls preload="auto" style="width: 60%%;"><source src="/download-share?file=' + filePath + '" type="video/' + fileExtension + '">Your browser does not support the video element.</video>';
+                }
+            }
+        }
+
+        function createImagePreview(filePath, id) {
+            var previewElement = document.getElementById(id);
+            if (previewElement.innerHTML !== '') {
+                previewElement.innerHTML = '';
+            } else {
+                previewElement.innerHTML = '<img src="/download-share?file=' + filePath + '" alt="Image preview" style="max-width: 60%%;">';
+            }
+        }
+
+        function createTextPreview(filePath, id) {
+            var previewElement = document.getElementById(id);
+            if (previewElement.innerHTML !== '') {
+                previewElement.innerHTML = '';
+            } else {
+                fetch('/download-share?file=' + filePath)
+				.then(response => response.text())
+				.then(data => {
+					previewElement.innerHTML = '<textarea id="textarea' + id + '"></textarea>';
+					
+					var editor = CodeMirror.fromTextArea(document.getElementById('textarea' + id), {
+						lineNumbers: true,
+						mode: getCodeMirrorMode(filePath),
+						theme: 'dracula',
+						readOnly: true,
+						autoCloseBrackets: true,
+						autofocus: true,
+						matchBrackets: true,
+						indentUnit: 4,
+						indentWithTabs: true
+					});
+					
+					editor.setValue(data);
+					window['editor' + id] = editor;
+				});
+            }
+        }
+
+        function getCodeMirrorMode(filePath) {
+		var extension = filePath.split('.').pop().toLowerCase();
+		switch (extension) {
+			case 'js':
+				return 'javascript';
+			case 'html':
+				return 'htmlmixed';
+			case 'css':
+				return 'css';
+			case 'py':
+				return 'python';
+			case 'go':
+				return 'text/x-go';
+			case 'xml':
+				return 'xml';
+			case 'json':
+				return { name: 'javascript', json: true };
+			// 添加更多文件类型
+			default:
+				return 'text/plain';
+		}
 	}
-}
-	
-function createVideoPlayer(filePath, id) {
-	var playerElement = document.getElementById(id);
-	if (playerElement.innerHTML !== '') {
-		// 如果已经创建了播放器，那么停止播放并隐藏
-		playerElement.innerHTML = '';
-	} else {
-		// 否则，创建新的播放器，但不自动加载媒体
-		playerElement.innerHTML = '<video controls preload="auto" style="max-width: 80vw; max-height: 500px;"><source src="/download-share?file=' + filePath + '" type="video/mp4">Your browser does not support the video element.</video>';
-	}
-}
-	
+        </script>
 
-function createImagePreview(filePath, id) {
-    var previewElement = document.getElementById(id);
-    if (previewElement.innerHTML !== '') {
-        // 如果已经创建了预览，那么清除预览
-        previewElement.innerHTML = '';
-    } else {
-        // 否则，创建新的预览
-        // 添加了style属性，设定了最大宽度和最大高度，图片会自动缩放以适应这个尺寸，同时保持其原始的长宽比
-        previewElement.innerHTML = '<img src="/download-share?file=' + filePath + '" alt="Image preview" style="max-width: 500px; max-height: 500px;">';
-    }
-}
+		<script>
+		function goBack() {
+			window.history.back();
+		}
+		</script>
 
-function createTextPreview(filePath, id) {
-    var previewElement = document.getElementById(id);
-    if (previewElement.innerHTML !== '') {
-        // 如果已经创建了预览，那么清除预览
-        previewElement.innerHTML = '';
-    } else {
-        // 否则，发送请求获取文件内容
-        fetch('/download-share?file=' + filePath)
-            .then(response => response.text())
-            .then(data => {
-                // 创建一个textarea元素，用户可以在这个元素中预览内容
-                previewElement.innerHTML = '<textarea id="textarea' + id + '" style="width: 80vw; height: 500px;">' + data + '</textarea>';
-            });
-    }
-}
+    </body>
+    </html>
+    `)
 
-</script>	
-`)
 	// 添加返回上一级文件夹的链接
 
 	if sharedPath != "" {
-		// 获取sharedPath的绝对路径
-		absoluteSharedPath, err := filepath.Abs(sharedPath)
-		if err != nil {
-			// 处理错误，例如显示错误信息或记录日志
-			return
-		}
-
-		// 确保sharedPath是在uploadDir目录下
-		if !strings.HasPrefix(absoluteSharedPath, uploadDir) {
-			// 如果不是，则可能需要处理这种情况，例如显示错误信息或者重定向到安全的地方
-			return
-		}
-
-		// 获取sharedPath的父目录
-		parentPath := filepath.Dir(sharedPath)
-		if parentPath == "." || parentPath == "/" {
-			parentPath = ""
-		} else {
-			// 确保父路径是相对于uploadDir的相对路径
-			parentPath = filepath.ToSlash(parentPath)
-		}
-
-		// 使用父目录的共享ID
-		parentShareID, found := findShareIDByPath(parentPath)
-		if found {
-			// 确保父共享ID对应的路径是sharedPath的直接父路径
-			parentSharedPath, _ := findPathByShareID(parentShareID)
-			if filepath.Dir(absoluteSharedPath) == filepath.Clean(parentSharedPath) {
-				fmt.Fprintf(w, "<a href='/shared-folder/%s'>Back</a><br>", parentShareID)
-			} else {
-				// 如果父共享ID对应的不是直接父路径，则不显示返回链接
-				// 可以选择不做任何操作，或者提供其他导航选项
-			}
-		} else {
-			// 如果找不到父目录的共享ID，可能需要处理这种情况
-			// 比如显示错误信息或者提供返回到根目录的链接
-		}
+		fmt.Fprintf(w, `
+			<div class="mt-4">
+				<button onclick="goBack()" class="btn btn-secondary">Back</button>
+			</div>
+		`)
 	}
-
 }
 
 // findShareID 通过文件路径查找共享ID
@@ -857,80 +974,269 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 	})
 
 	fmt.Fprintf(w, `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>File Manager</title>
-    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/codemirror.min.css">
-    <style>
-        .file-item {
-            padding: 10px;
-            border-bottom: 1px solid #eee;
-        }
-        .file-item:hover {
-            background-color: #f8f9fa;
-        }
-        .btn-group-sm > .btn {
-            padding: .25rem .5rem;
-            font-size: .875rem;
-            line-height: 1.5;
-            border-radius: .2rem;
-        }
-        .preview-container {
-            margin-top: 10px;
-            margin-bottom: 20px;
-        }
-        .CodeMirror {
-            height: 300px;
-            border: 1px solid #ddd;
-        }
-    </style>
-</head>
-<body>
-    <div class="container mt-4">
-        <h1 class="mb-4">Files in %s</h1>
-        <div class="row mb-4">
-            <div class="col-md-6">
-                <h2>Upload Files</h2>
-                <form action="/upload?path=%s" method="post" enctype="multipart/form-data">
-                    <div class="custom-file mb-2">
-                        <input type="file" class="custom-file-input" name="files" multiple>
-                        <label class="custom-file-label" for="customFile">Choose files</label>
-                    </div>
-                    <button type="submit" class="btn btn-primary">Upload Files</button>
-                </form>
-            </div>
-            <div class="col-md-6">
-                <h2>Upload Folder</h2>
-                <form action="/upload?path=%s" method="post" enctype="multipart/form-data">
-                    <div class="custom-file mb-2">
-                        <input type="file" class="custom-file-input" name="folder" webkitdirectory directory multiple>
-                        <label class="custom-file-label" for="customFile">Choose folder</label>
-                    </div>
-                    <button type="submit" class="btn btn-primary">Upload Folder</button>
-                </form>
-            </div>
-        </div>
-        <div class="row mb-4">
-            <div class="col-md-6">
-                <h2>Create New Folder</h2>
-                <form action="/new-folder?path=%s" method="post" class="form-inline">
-                    <input type="text" name="folder_name" class="form-control mr-2" placeholder="Folder Name">
-                    <button type="submit" class="btn btn-success">Create Folder</button>
-                </form>
-            </div>
-            <div class="col-md-6">
-                <h2>Create New Text File</h2>
-                <form action="/new-text-file?path=%s" method="post" class="form-inline">
-                    <input type="text" name="file_name" class="form-control mr-2" placeholder="File Name">
-                    <button type="submit" class="btn btn-success">Create Text File</button>
-                </form>
-            </div>
-        </div>
-        <div class="file-list">
+	<!DOCTYPE html>
+	<html lang="en">
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<title>Pango File Manager</title>
+		<link rel="icon" type="image/x-icon" href="/static/images/favicon.ico">
+		<link rel="stylesheet" href="/static/css/bootstrap.min.css">
+		<link rel="stylesheet" href="/static/css/codemirror.min.css">
+		<link href="/static/css/bootstrap.min.css" rel="stylesheet">
+		<style>
+			.file-item {
+				padding: 15px;
+				border-bottom: 1px solid #eee;
+				transition: background-color 0.3s;
+			}
+			.file-item:hover {
+				background-color: #f8f9fa;
+			}
+			.btn {
+				border-radius: 20px;
+				padding: 5px 15px;
+				margin: 2px;
+				transition: all 0.3s;
+			}
+			.btn:hover {
+				transform: translateY(-2px);
+				box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+			}
+			.btn-primary { background-color: #007bff; }
+			.btn-info { background-color: #17a2b8; }
+			.btn-danger { background-color: #dc3545; }
+			.btn-warning { background-color: #ffc107; }
+			.btn-secondary { background-color: #6c757d; }
+			.btn-outline-info { 
+				color: #17a2b8; 
+				border-color: #17a2b8;
+			}
+			.btn-outline-info:hover {
+				color: #fff;
+				background-color: #17a2b8;
+			}
+			.preview-container {
+				margin-top: 15px;
+				margin-bottom: 15px;
+			}
+			.CodeMirror {
+				height: 450px;
+				border: 1px solid #ddd;
+				border-radius: 5px;
+			}
+			@media (max-width: 768px) {
+				.btn-group-sm > .btn {
+					padding: 3px 8px;
+					font-size: 0.75rem;
+				}
+				.file-item .row {
+					flex-direction: column;
+				}
+				.file-item .col-md-6 {
+					width: 100%%;
+					margin-bottom: 10px;
+				}
+				.btn-group {
+					display: flex;
+					flex-wrap: wrap;
+					justify-content: center;
+				}
+			}
+
+			.card {
+				background-color: #ffffff; /* 卡片背景颜色 */
+				border: 1px solid #dee2e6; /* 卡片边框颜色 */
+				border-radius: 10px; /* 卡片圆角 */
+				padding: 20px;
+				margin-bottom: 20px;
+			}
+			.card-title {
+				font-size: 1.5rem;
+				font-weight: bold;
+				color: #007bff; /* 标题颜色 */
+				text-transform: uppercase; /* 标题大写 */
+				border-bottom: 2px solid #007bff; /* 标题底部边框 */
+				padding-bottom: 10px;
+				margin-bottom: 15px;
+			}
+			.form-control {
+				border-radius: 5px; /* 输入框圆角 */
+			}
+			.btn-success {
+				background-color: #28a745;
+				border-color: #28a745;
+				border-radius: 5px; /* 按钮圆角 */
+				padding: 8px 16px; /* 按钮内边距 */
+				font-weight: bold; /* 按钮字体加粗 */
+				text-transform: uppercase; /* 按钮文本大写 */
+			}
+			.btn-success:hover {
+				background-color: #218838;
+				border-color: #1e7e34;
+			}
+		</style>
+
+	</head>
+	<body>
+		<div class="container mt-4">
+			<h1 class="mb-4 text-center text-primary">Files in %s</h1>
+			<div class="row mb-4">
+				<div class="col-md-6">
+					<!-- Upload Files Card -->
+					<div class="card shadow-sm">
+						<div class="card-body">
+							<h2 class="card-title">Upload Files</h2>
+							<form id="uploadForm" onsubmit="return uploadFile()">
+								<div class="custom-file mb-2">
+									<input type="file" class="custom-file-input" name="files" id="fileInput" multiple onchange="showSelectedFiles()">
+									<label class="custom-file-label" for="fileInput">Choose files</label>
+								</div>
+								<button type="submit" class="btn btn-primary">Upload Files</button>
+							</form>
+							<div id="progress" class="mt-2"></div>
+							<div id="fileList" class="mt-2"></div>
+						</div>
+					</div>
+				</div>
+				<div class="col-md-6">
+					<!-- Upload Folder Card -->
+					<div class="card shadow-sm">
+						<div class="card-body">
+							<h2 class="card-title">Upload Folder</h2>
+							<form id="uploadFolderForm" onsubmit="return uploadFolder()">
+								<div class="custom-file mb-2">
+									<input type="file" class="custom-file-input" name="folder" id="folderInput" webkitdirectory directory multiple onchange="showSelectedFolder()">
+									<label class="custom-file-label" for="folderInput">Choose folder</label>
+								</div>
+								<button type="submit" class="btn btn-primary">Upload Folder</button>
+							</form>
+							<div id="folderProgress" class="mt-2"></div>
+							<div id="folderList" class="mt-2"></div>
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<script>
+		function showSelectedFiles() {
+			const input = document.getElementById('fileInput');
+			const fileList = document.getElementById('fileList');
+			fileList.innerHTML = '';
+
+			if (input.files.length > 0) {
+				const ul = document.createElement('ul');
+				Array.from(input.files).forEach(file => {
+					const li = document.createElement('li');
+					li.textContent = file.name;
+					ul.appendChild(li);
+				});
+				fileList.appendChild(ul);
+			} else {
+				fileList.textContent = 'No files selected';
+			}
+		}
+
+		function showSelectedFolder() {
+			const input = document.getElementById('folderInput');
+			const folderList = document.getElementById('folderList');
+			folderList.innerHTML = '';
+
+			if (input.files.length > 0) {
+				const ul = document.createElement('ul');
+				Array.from(input.files).forEach(file => {
+					const li = document.createElement('li');
+					li.textContent = file.webkitRelativePath;
+					ul.appendChild(li);
+				});
+				folderList.appendChild(ul);
+			} else {
+				folderList.textContent = 'No folder selected';
+			}
+		}
+		</script>
+
+		<script>
+		function uploadFile() {
+			var formData = new FormData(document.getElementById('uploadForm'));
+			return uploadData(formData, '/upload?path=%s', 'progress');
+		}
+
+		function uploadFolder() {
+			var formData = new FormData(document.getElementById('uploadFolderForm'));
+			return uploadData(formData, '/upload?path=%s', 'folderProgress');
+		}
+
+		function uploadData(formData, url, progressId) {
+			var xhr = new XMLHttpRequest();
+			xhr.open('POST', url, true);
+			var startTime = new Date().getTime();
+			xhr.upload.onprogress = function(e) {
+				if (e.lengthComputable) {
+					var percentComplete = (e.loaded / e.total) * 100;
+					var currentTime = new Date().getTime();
+					var elapsedTime = (currentTime - startTime) / 1000;
+					var uploadSpeed = e.loaded / elapsedTime;
+					var remainingTime = (e.total - e.loaded) / uploadSpeed;
+					
+					var progressText = percentComplete.toFixed(2) + '%%';
+					progressText += ' | 速度: ' + formatSize(uploadSpeed) + '/s';
+					progressText += ' | 剩余时间: ' + formatTime(remainingTime);
+					
+					document.getElementById(progressId).innerHTML = progressText;
+				}
+			};
+			xhr.onload = function() {
+				if (this.status == 200) {
+					window.location.reload();
+				} else {
+					alert('Upload failed: ' + this.responseText);
+				}
+			};
+			xhr.send(formData);
+			return false;
+		}
+
+		function formatSize(bytes) {
+			if (bytes < 1024) return bytes + ' B';
+			else if (bytes < 1048576) return (bytes / 1024).toFixed(2) + ' KB';
+			else if (bytes < 1073741824) return (bytes / 1048576).toFixed(2) + ' MB';
+			else return (bytes / 1073741824).toFixed(2) + ' GB';
+		}
+
+		function formatTime(seconds) {
+			if (seconds < 60) return seconds.toFixed(0) + ' 秒';
+			else if (seconds < 3600) return (seconds / 60).toFixed(0) + ' 分钟';
+			else return (seconds / 3600).toFixed(1) + ' 小时';
+		}
+		</script>
+		<div class="container mt-4">
+			<div class="container mt-4">
+				<div class="row mb-4">
+					<div class="col-md-6">
+						<!-- Create New Folder Card -->
+						<div class="card shadow-sm">
+							<h2 class="card-title">Create New Folder</h2>
+							<form action="/new-folder?path=%s" method="post" class="form-inline">
+								<input type="text" name="folder_name" class="form-control mr-2" placeholder="Folder Name">
+								<button type="submit" class="btn btn-success">Create Folder</button>
+							</form>
+						</div>
+					</div>
+					<div class="col-md-6">
+						<!-- Create New Text File Card -->
+						<div class="card shadow-sm">
+							<h2 class="card-title">Create New Text File</h2>
+							<form action="/new-text-file?path=%s" method="post" class="form-inline">
+								<input type="text" name="file_name" class="form-control mr-2" placeholder="File Name">
+								<button type="submit" class="btn btn-success">Create Text File</button>
+							</form>
+						</div>
+					</div>
+				</div>
+			</div>
+			<div class="file-list">
     `, currentPath, url.QueryEscape(currentPath), url.QueryEscape(currentPath), url.QueryEscape(currentPath), url.QueryEscape(currentPath))
 
 	for i, file := range files {
@@ -951,18 +1257,20 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 			shareID, shared := findShareIDByPath(relativeFilePath)
 			shareLink := ""
 			if shared {
-				shareLink = fmt.Sprintf(`<a href='http://%s/shared/%s' class="btn btn-outline-info btn-sm">Shared Link</a>`, r.Host, shareID)
+				shareURL := fmt.Sprintf("http://%s/shared/%s", r.Host, shareID)
+				shareLink = fmt.Sprintf(`<a href='#' onclick="showExistingSharePopup('%s', event)" class="btn btn-outline-info btn-sm">Shared Link</a>`, shareURL)
 			}
 			fmt.Fprintf(w, `
                 <div class="file-item">
                     <div class="row align-items-center">
-                        <div class="col-md-6">
-                            <strong>[Folder] %s</strong> (Last modified: %s)
+                        <div class="col-md-6 mb-2 mb-md-0">
+                            <strong>[Folder] %s</strong><br>
+                            <small class="text-muted">Last modified: %s</small>
                         </div>
                         <div class="col-md-6">
-                            <div class="btn-group btn-group-sm float-right" role="group">
+                            <div class="btn-group btn-group-sm d-flex flex-wrap justify-content-end" role="group">
                                 <a href='/files?path=%s' class="btn btn-primary">Open</a>
-                                <a href='/share?file=%s' class="btn btn-info">Share Folder</a>
+                                <a href='#' onclick="showSharePopup('%s', event)" class="btn btn-info">Share Folder</a>
                                 <a href='#' onclick="confirmDelete('%s')" class="btn btn-danger">Delete</a>
                                 <a href='#' onclick="promptRename('%s')" class="btn btn-warning">Rename</a>
                                 <a href='#' onclick="promptMove('%s')" class="btn btn-secondary">Move</a>
@@ -978,24 +1286,26 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 			shareID, shared := findShareIDByPath(filePath)
 			shareLink := ""
 			if shared {
-				shareLink = fmt.Sprintf(`<a href='http://%s/shared/%s' class="btn btn-outline-info btn-sm">Shared Link</a>`, r.Host, shareID)
+				shareURL := fmt.Sprintf("http://%s/shared/%s", r.Host, shareID)
+				shareLink = fmt.Sprintf(`<a href='#' onclick="showExistingSharePopup('%s', event)" class="btn btn-outline-info btn-sm">Shared Link</a>`, shareURL)
 			}
 			directLink := generateDirectLink(filePath, r.Host)
 
 			fmt.Fprintf(w, `
                 <div class="file-item">
                     <div class="row align-items-center">
-                        <div class="col-md-6">
-                            <strong>%s</strong> (size: %s, last modified: %s)
+                        <div class="col-md-6 mb-2 mb-md-0">
+                            <strong>%s</strong><br>
+                            <small class="text-muted">Size: %s, Last modified: %s</small>
                         </div>
                         <div class="col-md-6">
-                            <div class="btn-group btn-group-sm float-right" role="group">
+                            <div class="btn-group btn-group-sm d-flex flex-wrap justify-content-end" role="group">
                                 <a href='/download?file=%s' class="btn btn-primary">Download</a>
-                                <a href='/share?file=%s' class="btn btn-info">Share</a>
+                                <a href='#' onclick="showSharePopup('%s', event)" class="btn btn-info">Share</a>
                                 <a href='#' onclick="confirmDelete('%s')" class="btn btn-danger">Delete</a>
                                 <a href='#' onclick="promptRename('%s')" class="btn btn-warning">Rename</a>
                                 <a href='#' onclick="promptMove('%s')" class="btn btn-secondary">Move</a>
-                                <a href='%s' class="btn btn-secondary">Direct Link</a>
+                                <a href='%s' class="btn btn-info">Direct Link</a>
                                 %s
             `, fileName, fileSize, modTime, url.QueryEscape(relativeFilePath), url.QueryEscape(relativeFilePath), deletePath, url.QueryEscape(relativeFilePath), url.QueryEscape(relativeFilePath), directLink, shareLink)
 
@@ -1009,7 +1319,7 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
                             </div>
                         </div>
                     </div>
-                    <small class="text-muted">Download count: %d</small>
+                    <small class="text-muted d-block mt-2">Download count: %d</small>
                     <div class="preview-container" id="%s"></div>
                 </div>
             `, downloadCount, "preview"+strconv.Itoa(i))
@@ -1022,16 +1332,204 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 	<footer class="mt-5 mb-3 text-center">
         <p class="text-muted">Created by sligter | <a href="https://github.com/sligter/pango" target="_blank">GitHub</a></p>
     </footer>
-    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.5.3/dist/umd/popper.min.js"></script>
-    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/mode/javascript/javascript.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/mode/xml/xml.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/mode/htmlmixed/htmlmixed.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/mode/css/css.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.62.0/mode/markdown/markdown.min.js"></script>
+		<script src="/static/jquery/jquery-3.5.1.slim.min.js"></script>
+        <script src="/static/js/popper.min.js"></script>
+        <script src="/static/js/bootstrap.min.js"></script>
+        <script src="/static/js/codemirror.min.js"></script>
+        <script src="/static/js/javascript.min.js"></script>
+        <script src="/static/js/xml.min.js"></script>
+        <script src="/static/js/htmlmixed.min.js"></script>
+        <script src="/static/js/css.min.js"></script>
+        <script src="/static/js/markdown.min.js"></script>
+
+		<link rel="stylesheet" href="/static/css/codemirror.min.css">
+		<link rel="stylesheet" href="/static/css/monokai.min.css">
+		<link rel="stylesheet" href="/static/css/dracula.min.css">
+		<script src="/static/js/python.min.js"></script>
+		<script src="/static/js/go.min.js"></script>
+<!-- 根据需要添加更多语言模式 -->
     <script>
+	// 在 <script> 标签中添加以下函数
+		// 保留这个函数，用于处理新的分享请求
+	function showSharePopup(filePath, event) {
+		// 阻止默认行为和事件冒泡
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+
+		// 记录当前滚动位置
+		const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
+
+		fetch('/share?file=' + encodeURIComponent(filePath))
+			.then(response => response.json())
+			.then(data => {
+				showExistingSharePopup(data.url);
+				// 在显示弹窗后恢复滚动位置
+				window.scrollTo(0, scrollPosition);
+
+				// 添加 Shared Link 按钮
+				var shareButton = event.target;
+				var buttonGroup = shareButton.closest('.btn-group');
+				var sharedLinkButton = document.createElement('a');
+				sharedLinkButton.href = '#';
+				sharedLinkButton.onclick = function(e) { showExistingSharePopup(data.url, e); };
+				sharedLinkButton.className = 'btn btn-outline-info btn-sm';
+				sharedLinkButton.textContent = 'Shared Link';
+				buttonGroup.appendChild(sharedLinkButton);
+			})
+			.catch(error => console.error('Error:', error));
+	}
+
+	function showExistingSharePopup(shareURL) {
+
+		if (event) {
+			event.preventDefault();
+			event.stopPropagation();
+		}
+		
+		// 记录当前滚动位置
+    	const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
+
+		// 创建遮罩层
+		var overlay = document.createElement('div');
+		overlay.style.position = 'fixed';
+		overlay.style.top = '0';
+		overlay.style.left = '0';
+		overlay.style.width = '100%%';
+		overlay.style.height = '100%%';
+		overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+		overlay.style.zIndex = '999';
+
+		var popup = document.createElement('div');
+		popup.style.position = 'fixed';
+		popup.style.left = '50%%';
+		popup.style.top = '50%%';
+		popup.style.transform = 'translate(-50%%, -50%%)';
+		popup.style.backgroundColor = 'white';
+		popup.style.padding = '20px';
+		popup.style.borderRadius = '10px';
+		popup.style.boxShadow = '0 4px 6px rgba(0, 0, 0, 0.1)';
+		popup.style.zIndex = '1000';
+		popup.style.maxWidth = '90%%';
+		popup.style.width = '400px';
+
+		var content = document.createElement('p');
+		content.textContent = '分享链接：';
+		content.style.marginBottom = '10px';
+		popup.appendChild(content);
+
+		var urlInput = document.createElement('input');
+		urlInput.type = 'text';
+		urlInput.value = shareURL;
+		urlInput.readOnly = true;
+		urlInput.style.width = '100%%';
+		urlInput.style.padding = '5px';
+		urlInput.style.marginBottom = '15px';
+		urlInput.style.border = '1px solid #ccc';
+		urlInput.style.borderRadius = '4px';
+		popup.appendChild(urlInput);
+
+		var buttonContainer = document.createElement('div');
+		buttonContainer.style.display = 'flex';
+		buttonContainer.style.justifyContent = 'space-between';
+
+		var copyButton = document.createElement('button');
+		copyButton.textContent = '复制链接';
+		copyButton.style.padding = '8px 15px';
+		copyButton.style.backgroundColor = '#4CAF50';
+		copyButton.style.color = 'white';
+		copyButton.style.border = 'none';
+		copyButton.style.borderRadius = '4px';
+		copyButton.style.cursor = 'pointer';
+		copyButton.onclick = function(e) {
+			e.preventDefault(); // 防止页面滚动
+			copyToClipboard(shareURL);
+		};
+		buttonContainer.appendChild(copyButton);
+
+		var closeButton = document.createElement('button');
+		closeButton.textContent = '关闭';
+		closeButton.style.padding = '8px 15px';
+		closeButton.style.backgroundColor = '#f44336';
+		closeButton.style.color = 'white';
+		closeButton.style.border = 'none';
+		closeButton.style.borderRadius = '4px';
+		closeButton.style.cursor = 'pointer';
+		closeButton.onclick = function(e) {
+			e.preventDefault(); // 防止页面滚动
+			document.body.removeChild(overlay);
+		};
+		buttonContainer.appendChild(closeButton);
+
+		window.scrollTo(0, scrollPosition);
+
+		popup.appendChild(buttonContainer);
+		overlay.appendChild(popup);
+		document.body.appendChild(overlay);
+	}
+
+	function copyToClipboard(text) {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text).then(function() {
+				showToast('链接已复制到剪贴板');
+			}).catch(function(err) {
+				console.error('无法复制链接: ', err);
+				fallbackCopyTextToClipboard(text);
+			});
+		} else {
+			fallbackCopyTextToClipboard(text);
+		}
+	}
+
+	function fallbackCopyTextToClipboard(text) {
+		var textArea = document.createElement("textarea");
+		textArea.value = text;
+		textArea.style.position = "fixed";
+		textArea.style.top = "0";
+		textArea.style.left = "0";
+		textArea.style.width = "2em";
+		textArea.style.height = "2em";
+		textArea.style.padding = "0";
+		textArea.style.border = "none";
+		textArea.style.outline = "none";
+		textArea.style.boxShadow = "none";
+		textArea.style.background = "transparent";
+		document.body.appendChild(textArea);
+		textArea.focus();
+		textArea.select();
+
+		try {
+			var successful = document.execCommand('copy');
+			var msg = successful ? '链接已复制到剪贴板' : '无法复制链接';
+			showToast(msg);
+		} catch (err) {
+			console.error('回退方法也无法复制: ', err);
+			showToast('无法复制链接，请手动复制');
+		}
+
+		document.body.removeChild(textArea);
+	}
+
+	function showToast(message) {
+		var toast = document.createElement('div');
+		toast.textContent = message;
+		toast.style.position = 'fixed';
+		toast.style.bottom = '20px';
+		toast.style.left = '50%%';
+		toast.style.transform = 'translateX(-50%%)';
+		toast.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+		toast.style.color = 'white';
+		toast.style.padding = '10px 20px';
+		toast.style.borderRadius = '5px';
+		toast.style.zIndex = '2000';
+		document.body.appendChild(toast);
+
+		setTimeout(function() {
+			document.body.removeChild(toast);
+		}, 3000);
+	}
+
     function confirmDelete(itemPath) {
         if (confirm("Are you sure you want to delete this item?")) {
             var form = document.createElement('form');
@@ -1096,9 +1594,9 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
         } else {
             var fileExtension = filePath.split('.').pop().toLowerCase();
             if (fileExtension === 'mp3' || fileExtension === 'wav') {
-                playerElement.innerHTML = '<audio controls preload="auto" style="width: 100%;"><source src="/download?file=' + filePath + '" type="audio/' + fileExtension + '">Your browser does not support the audio element.</audio>';
+                playerElement.innerHTML = '<audio controls preload="auto" style="width: 100%%;"><source src="/download?file=' + filePath + '" type="audio/' + fileExtension + '">Your browser does not support the audio element.</audio>';
             } else {
-                playerElement.innerHTML = '<video controls preload="auto" style="width: 100%;"><source src="/download?file=' + filePath + '" type="video/' + fileExtension + '">Your browser does not support the video element.</video>';
+                playerElement.innerHTML = '<video controls preload="auto" style="width: 100%%;"><source src="/download?file=' + filePath + '" type="video/' + fileExtension + '">Your browser does not support the video element.</video>';
             }
         }
     }
@@ -1108,7 +1606,7 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
         if (previewElement.innerHTML !== '') {
             previewElement.innerHTML = '';
         } else {
-            previewElement.innerHTML = '<img src="/download?file=' + filePath + '" alt="Image preview" style="max-width: 100%;">';
+            previewElement.innerHTML = '<img src="/download?file=' + filePath + '" alt="Image preview" style="max-width: 60%%;">';
         }
     }
 
@@ -1118,23 +1616,50 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
             previewElement.innerHTML = '';
         } else {
             fetch('/download?file=' + filePath + '&timestamp=' + Date.now())
-                .then(response => response.text())
-                .then(data => {
-                    previewElement.innerHTML = '<textarea id="textarea' + id + '">' + data + '</textarea>' +
-                        '<button onclick="saveText(\'' + filePath + '\', \'' + id + '\')" class="btn btn-primary mt-2">Save</button>';
-                    
-                    var editor = CodeMirror.fromTextArea(document.getElementById('textarea' + id), {
-                        lineNumbers: true,
-                        mode: getCodeMirrorMode(filePath),
-                        theme: 'default',
-                        autoCloseBrackets: true,
-                        matchBrackets: true,
-                        indentUnit: 4,
-                        indentWithTabs: true
-                    });
-                    
-                    window['editor' + id] = editor;
+            .then(response => response.text())
+            .then(data => {
+                // 创建textarea元素
+                var textarea = document.createElement('textarea');
+                textarea.id = 'textarea' + id;
+                previewElement.appendChild(textarea);
+
+                // 创建保存按钮
+                var saveButton = document.createElement('button');
+                saveButton.innerHTML = 'Save';
+                saveButton.className = 'btn btn-primary mt-2';
+                saveButton.onclick = function() { saveText(filePath, id); };
+                previewElement.appendChild(saveButton);
+
+                // 初始化CodeMirror
+                var editor = CodeMirror.fromTextArea(textarea, {
+                    lineNumbers: true,
+                    mode: getCodeMirrorMode(filePath),
+                    theme: 'dracula',
+                    autoCloseBrackets: true,
+                    matchBrackets: true,
+                    indentUnit: 4,
+					autofocus: true,
+                    indentWithTabs: true
                 });
+
+                // 设置编辑器内容
+                editor.setValue(data);
+
+                // 存储编辑器实例
+                window['editor' + id] = editor;
+
+				// 在创建编辑器后添加主题选择器
+				var themeSelect = document.createElement('select');
+				themeSelect.className = 'form-control mt-2';
+				themeSelect.onchange = function() { changeTheme(id, this.value); };
+				['dracula','default','monokai'].forEach(function(theme) {
+					var option = document.createElement('option');
+					option.value = theme;
+					option.text = theme.charAt(0).toUpperCase() + theme.slice(1);
+					themeSelect.appendChild(option);
+				});
+				previewElement.appendChild(themeSelect);
+            });
         }
     }
     function getCodeMirrorMode(filePath) {
@@ -1146,6 +1671,10 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
                 return 'htmlmixed';
             case 'css':
                 return 'css';
+			case 'go':
+                return 'text/x-go';
+			case 'py':
+                return 'python';
             case 'md':
                 return 'markdown';
             default:
@@ -1153,23 +1682,33 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
         }
     }
 
+	function changeTheme(id, theme) {
+		var editor = window['editor' + id];
+		editor.setOption("theme", theme);
+	}
+
+	
+
     function saveText(filePath, id) {
-        var editor = window['editor' + id];
-        var content = editor.getValue();
-        var formData = new FormData();
-        formData.append('file', filePath);
-        formData.append('content', content);
-        fetch('/save', {
-            method: 'POST',
-            body: formData
-        }).then(response => {
-            if (response.ok) {
-                alert('Save successful!');
-            } else {
-                alert('Save failed!');
-            }
-        });
-    }
+		var editor = window['editor' + id];
+		var content = editor.getValue();
+		
+		fetch('/save', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: 'file=' + encodeURIComponent(filePath) + '&content=' + encodeURIComponent(content)
+		})
+		.then(response => response.text())
+		.then(data => {
+			alert('File saved successfully');
+		})
+		.catch((error) => {
+			console.error('Error:', error);
+			alert('Error saving file');
+		});
+	}
     </script>
     `)
 

@@ -228,6 +228,7 @@ func StartServer(state *State) {
 	server.StartServer(state.Config.UploadDir, state.Config.Username, state.Config.Password, state.Config.Port, state.Config.Domain)
 
 	// Output server start log messages
+	fmt.Println("Developed by sligter-老舟")
 	fmt.Println("Starting server with the following settings:")
 	fmt.Printf("Pango Directory: %s\n", state.Config.UploadDir)
 	fmt.Printf("Username: %s\n", state.Config.Username)

@@ -1,0 +1,280 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"os"
+	"pango-gui/server"
+	"runtime"
+
+	"image/color"
+
+	"gioui.org/app"
+	_ "gioui.org/app/permission/storage"
+	"gioui.org/layout"
+	"gioui.org/op"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
+	"github.com/sqweek/dialog"
+)
+
+// ServerConfig 存储服务器配置
+type ServerConfig struct {
+	UploadDir string `json:"upload_dir"`
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	Port      string `json:"port"`
+	Domain    string `json:"domain"`
+}
+
+// State 包含所有输入框控件和按钮状态
+type State struct {
+	UploadDir       widget.Editor
+	Username        widget.Editor
+	Password        widget.Editor
+	Port            widget.Editor
+	Domain          widget.Editor
+	StartServerBtn  widget.Clickable
+	StopServerBtn   widget.Clickable
+	IsRunning       bool
+	LogEditor       widget.Editor
+	Config          ServerConfig
+	FolderPickerBtn widget.Clickable
+	AuthorLink      widget.Clickable
+}
+
+func main() {
+	go func() {
+		w := app.Window{}
+		w.Option(app.Title("pango - v0.0.3"))
+		state := State{
+			UploadDir: widget.Editor{SingleLine: true, Submit: true},
+			Username:  widget.Editor{SingleLine: true, Submit: true},
+			Password:  widget.Editor{SingleLine: true, Submit: true, Mask: '•'},
+			Port:      widget.Editor{SingleLine: true, Submit: true},
+			Domain:    widget.Editor{SingleLine: true, Submit: true},
+			IsRunning: false, // 初始化 IsRunning 为 false
+			LogEditor: widget.Editor{SingleLine: false, Submit: false},
+		}
+		state.loadConfig() // 从配置文件加载配置
+		if err := loop(&w, &state); err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+
+	}()
+	app.Main()
+}
+
+func (s *State) loadConfig() {
+	configFile := getConfigFilePath()
+	data, err := ioutil.ReadFile(configFile)
+	if err != nil {
+		// 如果配置文件不存在,则使用默认值
+		s.Config = ServerConfig{}
+		return
+	}
+
+	err = json.Unmarshal(data, &s.Config)
+	if err != nil {
+		log.Printf("Failed to load config: %v", err)
+		s.Config = ServerConfig{}
+		return
+	}
+
+	// 将配置数据设置到输入框
+	s.UploadDir.SetText(s.Config.UploadDir)
+	s.Username.SetText(s.Config.Username)
+	s.Password.SetText(s.Config.Password)
+	s.Port.SetText(s.Config.Port)
+	s.Domain.SetText(s.Config.Domain)
+}
+
+func (s *State) saveConfig() {
+	configFile := getConfigFilePath()
+	s.Config.UploadDir = s.UploadDir.Text()
+	s.Config.Username = s.Username.Text()
+	s.Config.Password = s.Password.Text()
+	s.Config.Port = s.Port.Text()
+	s.Config.Domain = s.Domain.Text()
+
+	data, err := json.Marshal(s.Config)
+	if err != nil {
+		log.Printf("Failed to save config: %v", err)
+		return
+	}
+
+	err = ioutil.WriteFile(configFile, data, 0644)
+	if err != nil {
+		log.Printf("Failed to save config file: %v", err)
+	}
+}
+
+// getConfigFilePath 获取配置文件路径
+func getConfigFilePath() string {
+	if runtime.GOOS == "android" {
+		return "/storage/emulated/0/Download/config.json"
+	}
+	return "config.json"
+}
+
+func loop(w *app.Window, state *State) error {
+	var ops op.Ops
+	th := material.NewTheme()
+	state.LogEditor.ReadOnly = false // 是否只读模式,允许复制
+
+	// 去除文本框边框的样式定义：
+	noBorderMaterialEditor := func(th *material.Theme, editor *widget.Editor, hint string) material.EditorStyle {
+		ed := material.Editor(th, editor, hint)
+		return ed
+	}
+	for {
+		e := w.Event()
+		switch e := e.(type) {
+		case app.DestroyEvent:
+			return e.Err
+		case app.FrameEvent:
+			gtx := app.NewContext(&ops, e)
+			layout.Inset{Top: unit.Dp(16), Bottom: unit.Dp(16), Right: unit.Dp(16), Left: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				// Layout the widgets
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								uploadDirLabel := material.Editor(th, &state.UploadDir, "Input Directory")
+								return uploadDirLabel.Layout(gtx)
+							}),
+							layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+								return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+									if state.FolderPickerBtn.Clicked(gtx) {
+										go func() {
+											folderPath, err := dialog.Directory().Title("Select Pango Directory").Browse()
+											if err == nil {
+												state.UploadDir.SetText(folderPath)
+											}
+										}()
+									}
+									return material.Button(th, &state.FolderPickerBtn, "Select Pango Directory").Layout(gtx)
+								})
+							}),
+						)
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							usernameLabel := material.Editor(th, &state.Username, "Username")
+							return usernameLabel.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							passwordLabel := material.Editor(th, &state.Password, "Password")
+							return passwordLabel.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							portLabel := material.Editor(th, &state.Port, "Port(If left blank, it defaults to 2333.)")
+							return portLabel.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							domainLabel := material.Editor(th, &state.Domain, "Domain(If there is no domain name, please leave it blank)")
+							return domainLabel.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							startServerBtnLayout := material.Button(th, &state.StartServerBtn, "Start Server")
+							for state.StartServerBtn.Clicked(gtx) {
+								if !state.IsRunning {
+									state.IsRunning = true
+									state.saveConfig() // 保存配置到文件
+									StartServer(state)
+								}
+							}
+							return startServerBtnLayout.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							stopServerBtnLayout := material.Button(th, &state.StopServerBtn, "Stop Server")
+							for state.StopServerBtn.Clicked(gtx) {
+								if state.IsRunning {
+									state.IsRunning = false
+									StopServer(state)
+								}
+							}
+							return stopServerBtnLayout.Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(16)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							return noBorderMaterialEditor(th, &state.LogEditor, "Log Output").Layout(gtx)
+						})
+					}),
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return layout.Inset{Top: unit.Dp(24)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+							authorLabel := material.Body1(th, "\n\n\n\n\nBy: sligter\nhttps://github.com/sligter")
+							authorLabel.Color = color.NRGBA{R: 0, G: 0, B: 255, A: 255} // 蓝色
+							return authorLabel.Layout(gtx)
+						})
+					}),
+				)
+			})
+
+			e.Frame(gtx.Ops)
+		}
+	}
+}
+
+// StartServer starts the server
+func StartServer(state *State) {
+	// Capture original stdout
+	originalStdout := os.Stdout
+
+	// Create a buffer to hold the output
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	outC := make(chan string)
+
+	// Copy output in a separate goroutine so printing can't block indefinitely
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, r) // Capture output from os.Stdout
+		outC <- buf.String()
+	}()
+	// Start the server here
+	server.StartServer(state.Config.UploadDir, state.Config.Username, state.Config.Password, state.Config.Port, state.Config.Domain)
+
+	// Output server start log messages
+	fmt.Println("Starting server with the following settings:")
+	fmt.Printf("Pango Directory: %s\n", state.Config.UploadDir)
+	fmt.Printf("Username: %s\n", state.Config.Username)
+	fmt.Printf("Password: %s\n", state.Config.Password)
+	fmt.Printf("Port: %s\n", state.Config.Port)
+	fmt.Printf("Domain: %s\n", state.Config.Domain)
+
+	// Revert to the normal stdout and get the output from the buffer
+	w.Close()
+	os.Stdout = originalStdout
+	logs := <-outC
+
+	state.LogEditor.SetText(logs)
+
+}
+
+// StopServer stops the server
+func StopServer(state *State) {
+	server.StopServer()
+	// Implement server stop logic here
+	fmt.Println("Stopping server...")
+	// state.LogText += "Server stopped"
+	temptext := state.LogEditor.Text()
+	state.LogEditor.SetText(temptext + "\n" + "Server stopped")
+}
