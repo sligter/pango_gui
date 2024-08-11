@@ -586,15 +586,31 @@ func shareHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	filePath := filepath.Join(uploadDir, fileName)
+	// 解码 URL 编码的文件名
+	decodedFileName, err := url.QueryUnescape(fileName)
+	if err != nil {
+		http.Error(w, "Invalid file name", http.StatusBadRequest)
+		return
+	}
+
+	// 统一路径分隔符
+	decodedFileName = filepath.FromSlash(decodedFileName)
+
+	// 构建完整的文件路径
+	filePath := filepath.Join(uploadDir, decodedFileName)
+
+	// 检查文件或目录是否存在
 	info, err := os.Stat(filePath)
 	if err != nil {
 		http.Error(w, "File or directory not found", http.StatusNotFound)
 		return
 	}
 
+	// 生成分享 ID
 	shareID := generateShareID()
-	sharedFiles[shareID] = fileName
+
+	// 保存相对路径而不是完整路径
+	sharedFiles[shareID] = decodedFileName
 
 	var shareURL string
 	if info.IsDir() {
@@ -1361,7 +1377,7 @@ func filesHandler(w http.ResponseWriter, r *http.Request) {
 		// 记录当前滚动位置
 		const scrollPosition = window.pageYOffset || document.documentElement.scrollTop;
 
-		fetch('/share?file=' + encodeURIComponent(filePath))
+		fetch('/share?file=' + encodeURIComponent(filePath.replace(/\\/g, '/')))
 			.then(response => response.json())
 			.then(data => {
 				showExistingSharePopup(data.url);
