@@ -1,0 +1,11 @@
+# 排除文件
+*.log
+*.txt
+*.json
+*.yml
+*.xml
+*.zip
+*.apk
+*.exe
+*.syso
+*.idsig
